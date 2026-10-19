@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang='no'>
+<head>
+<meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'>
+<title>Bilde til Excel</title>
+<style>
+:root{--bg:#f6f7f9;--card:#fff;--ink:#1c2330;--muted:#667085;--line:#d9dee7;--accent:#1f7a4d}
+@media (prefers-color-scheme:dark){:root{--bg:#14171c;--card:#1d2128;--ink:#e8ebf0;--muted:#98a2b3;--line:#323946;--accent:#3fb97d}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 system-ui,sans-serif}
+main{max-width:1000px;margin:0 auto;padding:24px 16px}
+h1{font-size:1.6rem;margin:0 0 4px}
+p.sub{color:var(--muted);margin:0 0 20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin-bottom:16px}
+#drop{border:2px dashed var(--line);border-radius:12px;padding:32px 16px;text-align:center;cursor:pointer;color:var(--muted)}
+#drop.over{border-color:var(--accent);color:var(--ink)}
+#preview{max-width:100%;max-height:320px;display:block;margin:12px auto 0;border-radius:8px}
+.row{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-top:12px}
+label{font-size:.9rem;color:var(--muted)}
+select,input{font:inherit}
+button{font:inherit;border:0;border-radius:8px;padding:10px 16px;background:var(--accent);color:#fff;cursor:pointer}
+button:disabled{opacity:.45;cursor:not-allowed}
+#status{color:var(--muted);min-height:1.5em;margin:8px 0 0}
+#sheet{overflow:auto;max-height:520px;margin-top:12px}
+table{border-collapse:collapse;font:14px/1.3 Calibri,Arial,sans-serif}
+td{border:1px solid #c8ccd4;padding:3px 8px;white-space:nowrap;min-width:40px;background:#fff;color:#000}
+td:focus{outline:2px solid var(--accent)}
+</style>
+</head>
+<body>
+<main>
+  <h1>Bilde til Excel</h1>
+  <p class='sub'>Les tall og bokstaver fra et bilde av et regneark, og last ned en .xlsx-fil som ser ut som bildet. Alt skjer i nettleseren.</p>
+
+  <div class='card'>
+    <div id='drop'>Dra et bilde hit, klikk for å velge fil, eller lim inn med Ctrl+V</div>
+    <input id='file' type='file' accept='image/*' hidden>
+    <img id='preview' alt='Opplastet bilde' hidden>
+    <div class='row'>
+      <label>Språk
+        <select id='lang'>
+          <option value='nor+eng'>Norsk + engelsk</option>
+          <option value='eng'>Engelsk</option>
+          <option value='nor'>Norsk</option>
+        </select>
+      </label>
+      <label>Kolonnefølsomhet
+        <input id='sens' type='range' min='0.4' max='2.5' step='0.1' value='1'>
+      </label>
+      <label><input id='header' type='checkbox' checked> Første rad er overskrift</label>
+      <button id='run' disabled>Les bildet</button>
+    </div>
+    <p id='status' role='status'>Velg et bilde for å starte.</p>
+  </div>
+
+  <div class='card' id='result' hidden>
+    <div class='row' style='margin-top:0'>
+      <strong>Resultat – klikk i en celle for å rette</strong>
+      <button id='download'>Last ned .xlsx</button>
+    </div>
+    <div id='sheet'></div>
+  </div>
+</main>
+
+<script src='https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js'></script>
+<script src='https://cdnjs.cloudflare.com/ajax/libs/exceljs/4.4.0/exceljs.min.js'></script>
+<script>
+const $ = id => document.getElementById(id);
+let img = null, model = null, cache = null;
+
+function setStatus(t){ $('status').textContent = t; }
+
+/* ---------- Last opp bilde ---------- */
+const drop = $('drop'), fileInput = $('file');
+drop.addEventListener('click', () => fileInput.click());
+drop.addEventListener('dragover', e => { e.preventDefault(); drop.classList.add('over'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+drop.addEventListener('drop', e => { e.preventDefault(); drop.classList.remove('over'); loadFile(e.dataTransfer.files[0]); });
+fileInput.addEventListener('change', () => loadFile(fileInput.files[0]));
+window.addEventListener('paste', e => { const f = [...e.clipboardData.files][0]; if (f) loadFile(f); });
+
+function loadFile(f){
+  if (!f || !f.type.startsWith('image/')) { setStatus('Det må være en bildefil.'); return; }
+  const url = URL.createObjectURL(f);
+  const im = new Image();
+  im.onload = () => {
+    img = im; cache = null;
+    $('preview').src = url; $('preview').hidden = false;
+    $('run').disabled = false;
+    setStatus('Bilde lastet. Trykk «Les bildet».');
+  };
+  im.src = url;
+}
+
+/* ---------- OCR ---------- */
+function prepare(im){
+  const scale = Math.max(1, Math.min(3, 2000 / im.naturalWidth));
+  const c = document.createElement('canvas');
+  c.width = Math.round(im.naturalWidth * scale);
+  c.height = Math.round(im.naturalHeight * scale);
+  c.getContext('2d', { willReadFrequently: true }).drawImage(im, 0, 0, c.width, c.height);
+  return { c, scale };
+}
+
+function getWords(d){
+  if (d.words && d.words.length) return d.words;
+  const out = [];
+  (d.blocks || []).forEach(b => b.paragraphs.forEach(p => p.lines.forEach(l => l.words.forEach(w => out.push(w)))));
+  return out;
+}
+
+$('run').addEventListener('click', async () => {
+  $('run').disabled = true;
+  try {
+    const { c, scale } = prepare(img);
+    const worker = await Tesseract.createWorker($('lang').value, 1, {
+      logger: m => setStatus(m.status === 'recognizing text'
+        ? 'Leser tekst… ' + Math.round(m.progress * 100) + ' %'
+        : 'Forbereder (' + m.status + ')…')
+    });
+    await worker.setParameters({ tessedit_pageseg_mode: Tesseract.PSM.SPARSE_TEXT, preserve_interword_spaces: '1' });
+    const { data } = await worker.recognize(c, {}, { blocks: true });
+    await worker.terminate();
+    const words = getWords(data).filter(w => w.text.trim() && w.confidence > 30);
+    if (!words.length) throw new Error('Fant ingen tekst i bildet.');
+    cache = { words, canvas: c, scale };
+    rebuild();
+    setStatus('Ferdig: ' + model.cells.length + ' rader og ' + model.colW.length + ' kolonner. Rett feil i tabellen, og last ned.');
+  } catch (err) {
+    setStatus('Feil: ' + err.message);
+  } finally {
+    $('run').disabled = false;
+  }
+});
+
+function rebuild(){
+  model = buildGrid(cache.words, cache.canvas, cache.scale, parseFloat($('sens').value));
+  render(model);
+}
+$('sens').addEventListener('change', () => { if (cache) rebuild(); });
+$('header').addEventListener('change', () => { if (model) render(model); });
+
+/* ---------- Fra ord til rutenett ---------- */
+function median(a){ const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)] || 0; }
+function toHex(r, g, b){ return [r, g, b].map(v => v.toString(16).padStart(2, '0')).join('').toUpperCase(); }
+
+function buildGrid(words, canvas, scale, sens){
+  const H = median(words.map(w => w.bbox.y1 - w.bbox.y0));
+  const gapMax = H * 0.9 * sens;
+
+  // 1. Rader: ord med samme loddrette midtpunkt
+  const sorted = [...words].sort((a, b) => (a.bbox.y0 + a.bbox.y1) - (b.bbox.y0 + b.bbox.y1));
+  const rows = [];
+  for (const w of sorted){
+    const cy = (w.bbox.y0 + w.bbox.y1) / 2;
+    const r = rows[rows.length - 1];
+    if (r && Math.abs(cy - r.cy) < H * 0.6){
+      r.words.push(w);
+      r.cy = r.words.reduce((s, x) => s + (x.bbox.y0 + x.bbox.y1) / 2, 0) / r.words.length;
+    } else rows.push({ cy, words: [w] });
+  }
+
+  // 2. Celler i hver rad: ord som står tett, slås sammen
+  for (const r of rows){
+    r.words.sort((a, b) => a.bbox.x0 - b.bbox.x0);
+    r.cells = [];
+    for (const w of r.words){
+      const last = r.cells[r.cells.length - 1], b = w.bbox;
+      if (last && b.x0 - last.x1 < gapMax){
+        last.text += ' ' + w.text.trim();
+        last.x1 = Math.max(last.x1, b.x1);
+        last.y0 = Math.min(last.y0, b.y0);
+        last.y1 = Math.max(last.y1, b.y1);
+      } else r.cells.push({ text: w.text.trim(), x0: b.x0, x1: b.x1, y0: b.y0, y1: b.y1 });
+    }
+  }
+
+  // 3. Kolonner: tomrom i projeksjonen på x-aksen
+  const iv = rows.flatMap(r => r.cells.map(c => [c.x0, c.x1])).sort((a, b) => a[0] - b[0]);
+  const cols = [];
+  for (const [a, b] of iv){
+    const l = cols[cols.length - 1];
+    if (l && a - l.x1 < gapMax) l.x1 = Math.max(l.x1, b); else cols.push({ x0: a, x1: b });
+  }
+
+  // 4. Plasser hver celle i riktig kolonne, og mål utseendet i bildet
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  const cells = rows.map(() => cols.map(() => ({ text: '', bg: null, fg: '000000' })));
+  rows.forEach((r, ri) => r.cells.forEach(c => {
+    const mid = (c.x0 + c.x1) / 2;
+    let ci = cols.findIndex(k => mid >= k.x0 && mid <= k.x1);
+    if (ci < 0) ci = 0;
+    const cur = cells[ri][ci];
+    if (cur.text) cur.text += ' ' + c.text;
+    else Object.assign(cur, { text: c.text }, sample(ctx, c));
+  }));
+
+  return {
+    cells,
+    colW: cols.map(k => Math.max(6, (k.x1 - k.x0) / scale / 7 + 3)),
+    rowH: rows.map(() => Math.max(15, H / scale * 0.75 * 1.7)),
+    size: Math.min(20, Math.max(8, Math.round(H / scale * 0.9)))
+  };
+}
+
+// Bakgrunnsfarge (vanligste farge) og tekstfarge (piksler lengst fra bakgrunnen)
+function sample(ctx, c){
+  const cw = ctx.canvas.width, ch = ctx.canvas.height;
+  const x = Math.max(0, Math.floor(c.x0 - 3)), y = Math.max(0, Math.floor(c.y0 - 3));
+  const w = Math.max(1, Math.min(cw - x, Math.ceil(c.x1 - c.x0 + 6)));
+  const h = Math.max(1, Math.min(ch - y, Math.ceil(c.y1 - c.y0 + 6)));
+  const d = ctx.getImageData(x, y, w, h).data, bins = new Map();
+  for (let i = 0; i < d.length; i += 4){
+    const k = ((d[i] >> 4) << 8) | ((d[i + 1] >> 4) << 4) | (d[i + 2] >> 4);
+    const b = bins.get(k) || [0, 0, 0, 0];
+    b[0]++; b[1] += d[i]; b[2] += d[i + 1]; b[3] += d[i + 2];
+    bins.set(k, b);
+  }
+  let top = null;
+  for (const b of bins.values()) if (!top || b[0] > top[0]) top = b;
+  const bg = [top[1] / top[0], top[2] / top[0], top[3] / top[0]].map(Math.round);
+  const dist = []; let max = 0;
+  for (let i = 0; i < d.length; i += 4){
+    const e = Math.abs(d[i] - bg[0]) + Math.abs(d[i + 1] - bg[1]) + Math.abs(d[i + 2] - bg[2]);
+    dist.push(e); if (e > max) max = e;
+  }
+  const s = [0, 0, 0]; let n = 0;
+  if (max > 150) for (let i = 0, j = 0; i < d.length; i += 4, j++) if (dist[j] > max * 0.8){ s[0] += d[i]; s[1] += d[i + 1]; s[2] += d[i + 2]; n++; }
+  const fg = n ? s.map(v => Math.round(v / n)) : [0, 0, 0];
+  return { bg: bg.every(v => v >= 238) ? null : toHex(...bg), fg: toHex(...fg) };
+}
+
+// Tolker "1 234,56", "1,234.56" og "12.5" som tall. Tekst som "007" blir stående som tekst.
+function parseNum(s){
+  const t = String(s).replace(/\s+/g, '').replace(/[−–]/g, '-');
+  if (/^0\d/.test(t)) return null;
+  if (/^-?\d+([.,]\d+)?$/.test(t)) return parseFloat(t.replace(',', '.'));
+  if (/^-?\d{1,3}(,\d{3})+(\.\d+)?$/.test(t)) return parseFloat(t.replace(/,/g, ''));
+  if (/^-?\d{1,3}(\.\d{3})+(,\d+)?$/.test(t)) return parseFloat(t.replace(/\./g, '').replace(',', '.'));
+  return null;
+}
+
+/* ---------- Forhåndsvisning (redigerbar) ---------- */
+function render(m){
+  const t = document.createElement('table');
+  m.cells.forEach((row, ri) => {
+    const tr = t.insertRow();
+    row.forEach((c, ci) => {
+      const td = tr.insertCell();
+      td.contentEditable = 'true';
+      td.dataset.r = ri; td.dataset.c = ci;
+      td.textContent = c.text;
+      if (c.bg) td.style.background = '#' + c.bg;
+      td.style.color = '#' + c.fg;
+      td.style.textAlign = parseNum(c.text) !== null ? 'right' : 'left';
+      if (ri === 0 && $('header').checked) td.style.fontWeight = '700';
+    });
+  });
+  $('sheet').replaceChildren(t);
+  $('result').hidden = false;
+}
+$('sheet').addEventListener('input', e => {
+  const td = e.target;
+  if (td.dataset && td.dataset.r !== undefined) model.cells[td.dataset.r][td.dataset.c].text = td.textContent;
+});
+
+/* ---------- Excel ---------- */
+$('download').addEventListener('click', async () => {
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('Ark1');
+  const line = { style: 'thin', color: { argb: 'FFBFC4CC' } };
+  model.cells.forEach((row, ri) => {
+    const xr = ws.getRow(ri + 1);
+    xr.height = model.rowH[ri];
+    row.forEach((c, ci) => {
+      const cell = xr.getCell(ci + 1);
+      const n = parseNum(c.text);
+      cell.value = c.text === '' ? null : (n !== null ? n : c.text);
+      cell.font = { name: 'Calibri', size: model.size, bold: ri === 0 && $('header').checked, color: { argb: 'FF' + c.fg } };
+      if (c.bg) cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF' + c.bg } };
+      cell.alignment = { vertical: 'middle', horizontal: n !== null ? 'right' : 'left' };
+      cell.border = { top: line, left: line, bottom: line, right: line };
+    });
+  });
+  model.colW.forEach((w, i) => { ws.getColumn(i + 1).width = w; });
+  const buf = await wb.xlsx.writeBuffer();
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([buf], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' }));
+  a.download = 'bilde-til-excel.xlsx';
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+</script>
+</body>
+</html>
